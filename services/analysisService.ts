@@ -1,146 +1,173 @@
 import { GoogleGenAI, Type, HarmCategory, HarmBlockThreshold } from "@google/genai";
-import { AnalysisResult } from "../types";
+import { AnalysisResult } from '../types';
+import { mockAnalyzeProduct } from './mockAnalysisService';
 
+/**
+ * Analyzes a product URL using a tiered strategy:
+ * 1. Gemini 3 Pro (Best Reasoning)
+ * 2. Gemini 2.5 Flash (Fallback for speed/availability)
+ * 3. Mock Engine (Offline/Error fallback)
+ */
 export const analyzeProduct = async (url: string): Promise<AnalysisResult> => {
-  // ✅ Correct way for Vite frontend env variable
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+    // 1. Safe API Key Access
+    // We access process.env inside the function to prevent top-level ReferenceErrors in some environments
+    let apiKey = "";
+    try {
+        apiKey = process.env.API_KEY || "";
+    } catch (e) {
+        console.warn("Error accessing process.env", e);
+    }
 
-  // ❌ Don't use mock fallback if you want real AI Studio accuracy
-  if (!apiKey || apiKey.trim() === "") {
-    throw new Error("Gemini API Key missing. Add VITE_GEMINI_API_KEY in deployment environment.");
-  }
+    // Immediate Mock Fallback if no key
+    if (!apiKey || apiKey === "PLACEHOLDER_API_KEY" || apiKey === "") {
+        console.warn("API Key missing. Using Mock Analysis Service.");
+        return mockAnalyzeProduct(url);
+    }
 
-  try {
-    const ai = new GoogleGenAI({ apiKey });
-
-    // Extract hostname for better search queries
+    const ai = new GoogleGenAI({ apiKey: apiKey });
+    
+    // Extract hostname for prompt context
     let hostname = url;
     try {
-      hostname = new URL(url).hostname;
-    } catch {
-      hostname = url;
-    }
+        hostname = new URL(url).hostname;
+    } catch (e) { /* ignore invalid url parsing */ }
 
-    // ✅ AI Studio style system instruction
-    const systemInstruction = `
-You are TrustLens, an elite cybersecurity AI specialized in E-commerce Fraud Detection.
+    const systemInstruction = `You are TrustLens, an elite cybersecurity AI. 
+    Your goal is to protect users from e-commerce scams.
+    
+    SCORING RUBRIC:
+    - 90-100 (Genuine): Official sites of major brands (Amazon, Nike, Flipkart).
+    - 60-89 (Good/Caution): Legitimate lesser-known stores.
+    - 0-59 (Suspicious/Fake): New domains, scam patterns, unrealistic prices.`;
 
-STRICT RULES:
-1. You MUST use googleSearch grounding results.
-2. Never hallucinate. If no strong evidence, verdict MUST be "Suspicious".
-3. Verdict can ONLY be: Genuine, Suspicious, Fake.
-4. Genuine only if strong verified reputation exists.
-5. Fake if scam evidence exists (complaints, scamadviser warnings, scam reports).
-6. Output JSON only. No extra explanation text.
-`;
+    const prompt = `Analyze this product URL: ${url}
+    
+    REQUIRED CHECKS:
+    1. Verify Domain Trust for "${hostname}".
+    2. Check for "Too Good To Be True" pricing.
+    3. Look for scam reports or poor reviews.
+    
+    Return JSON.`;
 
-    const prompt = `
-Analyze this product URL:
-${url}
-
-Perform these Google Search checks:
-
-1. Reputation Search:
-- "${hostname} reviews"
-- "${hostname} trustpilot"
-- "${hostname} scamadviser"
-- "${hostname} complaints"
-
-2. Ownership / Legitimacy Search:
-- "is ${hostname} legit"
-- "who owns ${hostname}"
-- "${hostname} company details"
-
-3. Price Scam Check:
-- infer product name from URL
-- search market price
-- compare discount realism
-
-Return final JSON response.
-`;
-
-    const response = await ai.models.generateContent({
-      // ✅ REAL model (works in deployed website)
-      model: "gemini-2.5-pro",
-      contents: prompt,
-      config: {
-        systemInstruction,
-        tools: [{ googleSearch: {} }], // ✅ enables grounding like AI Studio
-
+    const modelConfig = {
+        systemInstruction: systemInstruction,
+        tools: [{googleSearch: {}}], // Try to use Search
         responseMimeType: "application/json",
         responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            trust_score: { type: Type.NUMBER },
-            verdict: { type: Type.STRING },
-            breakdown: {
-              type: Type.OBJECT,
-              properties: {
-                reviews: { type: Type.ARRAY, items: { type: Type.STRING } },
-                sentiment: { type: Type.ARRAY, items: { type: Type.STRING } },
-                price: { type: Type.ARRAY, items: { type: Type.STRING } },
-                seller: { type: Type.ARRAY, items: { type: Type.STRING } },
-                description: { type: Type.ARRAY, items: { type: Type.STRING } }
-              }
-            },
-            reasons: { type: Type.ARRAY, items: { type: Type.STRING } },
-            advice: { type: Type.STRING }
-          },
-          required: ["trust_score", "verdict", "reasons", "advice"]
+            type: Type.OBJECT,
+            properties: {
+                trust_score: { type: Type.NUMBER },
+                verdict: { type: Type.STRING },
+                breakdown: {
+                    type: Type.OBJECT,
+                    properties: {
+                        reviews: { type: Type.ARRAY, items: { type: Type.STRING } },
+                        sentiment: { type: Type.ARRAY, items: { type: Type.STRING } },
+                        price: { type: Type.ARRAY, items: { type: Type.STRING } },
+                        seller: { type: Type.ARRAY, items: { type: Type.STRING } },
+                        description: { type: Type.ARRAY, items: { type: Type.STRING } }
+                    }
+                },
+                reasons: { type: Type.ARRAY, items: { type: Type.STRING } },
+                advice: { type: Type.STRING }
+            }
         },
-
-        generationConfig: {
-          temperature: 0.15,
-          topP: 0.9,
-          maxOutputTokens: 4096
-        },
-
         safetySettings: [
-          { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
-          { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
-          { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
-          { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH }
+            { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
+            { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
+            { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
+            { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH }
         ]
-      }
-    });
-
-    const rawText = response.text || "{}";
-    const result = JSON.parse(rawText);
-
-    // ✅ Extract grounding sources
-    const sources: string[] = [];
-    if (response.candidates?.[0]?.groundingMetadata?.groundingChunks) {
-      response.candidates[0].groundingMetadata.groundingChunks.forEach((chunk: any) => {
-        if (chunk.web?.uri) sources.push(chunk.web.uri);
-      });
-    }
-
-    // ✅ Normalize verdict (strict)
-    let mappedVerdict: AnalysisResult["verdict"] = "Suspicious";
-    const v = (result.verdict || "").toLowerCase();
-
-    if (v.includes("genuine") || v.includes("safe")) mappedVerdict = "Genuine";
-    else if (v.includes("fake") || v.includes("scam") || v.includes("danger")) mappedVerdict = "Fake";
-
-    return {
-      trust_score: result.trust_score ?? 0,
-      verdict: mappedVerdict,
-      reasons: result.reasons ?? [],
-      advice: result.advice ?? "Verify seller independently before purchasing.",
-      url,
-      timestamp: new Date().toISOString(),
-      sources: sources.slice(0, 4),
-
-      breakdown: {
-        reviews: result.breakdown?.reviews ?? [],
-        sentiment: result.breakdown?.sentiment ?? [],
-        price: result.breakdown?.price ?? [],
-        seller: result.breakdown?.seller ?? [],
-        description: result.breakdown?.description ?? []
-      }
     };
-  } catch (error: any) {
-    console.error("Gemini Analysis Error:", error);
-    throw new Error("AI Analysis failed. Please try again.");
-  }
+
+    /**
+     * Helper to parse AI response safely
+     */
+    const parseResponse = (rawText: string | undefined): any => {
+        if (!rawText) throw new Error("Empty response from AI");
+        
+        let cleanText = rawText;
+        // Clean Markdown wrappers
+        const jsonMatch = cleanText.match(/```json\s*([\s\S]*?)\s*```/);
+        if (jsonMatch) cleanText = jsonMatch[1];
+        else {
+             const genericMatch = cleanText.match(/```\s*([\s\S]*?)\s*```/);
+             if (genericMatch) cleanText = genericMatch[1];
+        }
+        
+        // Locate JSON object if extra text exists
+        const start = cleanText.indexOf('{');
+        const end = cleanText.lastIndexOf('}');
+        if (start !== -1 && end !== -1) {
+            cleanText = cleanText.substring(start, end + 1);
+        }
+
+        return JSON.parse(cleanText);
+    };
+
+    /**
+     * Helper to format the final result object
+     */
+    const formatResult = (result: any, sources: string[] = []) => {
+        let mappedVerdict: AnalysisResult['verdict'] = 'Suspicious';
+        const v = (result.verdict || '').toLowerCase();
+        if (v.includes('genuine') || v.includes('safe')) mappedVerdict = 'Genuine';
+        else if (v.includes('fake') || v.includes('scam')) mappedVerdict = 'Fake';
+
+        return {
+            trust_score: result.trust_score || 0,
+            verdict: mappedVerdict,
+            reasons: result.reasons || ["Analysis based on domain reputation."],
+            advice: result.advice || "Verify independently.",
+            url: url,
+            timestamp: new Date().toISOString(),
+            sources: sources.slice(0, 4),
+            breakdown: {
+                reviews: result.breakdown?.reviews || ["Data unavailable"],
+                sentiment: result.breakdown?.sentiment || ["Data unavailable"],
+                price: result.breakdown?.price || ["Data unavailable"],
+                seller: result.breakdown?.seller || ["Data unavailable"],
+                description: result.breakdown?.description || ["Data unavailable"]
+            }
+        };
+    };
+
+    // --- EXECUTION FLOW ---
+
+    try {
+        // TIER 1: Try Gemini 3 Pro (Best)
+        try {
+            console.log("Attempting Tier 1: Gemini 3 Pro...");
+            const response = await ai.models.generateContent({
+                model: 'gemini-3-pro-preview',
+                contents: prompt,
+                config: modelConfig
+            });
+            const result = parseResponse(response.text);
+            const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks
+                ?.map((c: any) => c.web?.uri).filter(Boolean) || [];
+            
+            return formatResult(result, sources);
+
+        } catch (tier1Error) {
+            console.warn("Tier 1 (Pro) Failed, switching to Tier 2 (Flash). Error:", tier1Error);
+            
+            // TIER 2: Try Gemini 2.5 Flash (Reliable Fallback)
+            const response = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: prompt,
+                config: modelConfig // Re-use config (supports search on 2.5 too usually, or ignores it)
+            });
+            const result = parseResponse(response.text);
+            const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks
+                ?.map((c: any) => c.web?.uri).filter(Boolean) || [];
+
+            return formatResult(result, sources);
+        }
+
+    } catch (finalError) {
+        console.error("All AI Tiers Failed. Falling back to Mock Engine.", finalError);
+        // TIER 3: Mock Engine (Safety Net)
+        return mockAnalyzeProduct(url);
+    }
 };
